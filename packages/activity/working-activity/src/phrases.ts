@@ -8,6 +8,7 @@
  */
 
 import { langNow } from './lang.js'
+import type { WaitingReason } from './activity-event.js'
 
 /** A pool of copy fragments. */
 export type PhrasePool = readonly string[]
@@ -22,6 +23,49 @@ export function pickPhrase(entries: PhrasePool, previous?: string): string {
     next = entries[Math.floor(Math.random() * entries.length)] as string
   }
   return next
+}
+
+/** A rotation window: the turn's seed, and which window of it. */
+export interface PhraseSlot {
+  readonly seed: number
+  readonly slot: number
+}
+
+/**
+ * Deterministic 32-bit mix of a seed and a window index (avalanche, then mask).
+ *
+ * The point is reproducibility, not cryptography: the same inputs must always
+ * produce the same value, so a reader may re-derive a phrase as often as it
+ * likes without the copy moving under it.
+ */
+export function mixSlot(seed: number, slot: number): number {
+  let h = (Math.imul(seed | 0, 0x9E3779B1) ^ Math.imul(slot | 0, 0x85EBCA6B)) >>> 0
+  h = Math.imul(h ^ (h >>> 15), 0x2545F491) >>> 0
+  h = Math.imul(h ^ (h >>> 13), 0x9E3779B1) >>> 0
+  return (h ^ (h >>> 16)) >>> 0
+}
+
+/**
+ * Deterministic sibling of {@link pickPhrase}.
+ *
+ * The projected line is READ far more often than it is written — a client ticks
+ * it, the host validates it, a checkpoint may re-render it — so picking at
+ * random inside a read makes the copy churn on every read (measured: three
+ * different phrases across three consecutive 500 ms reads). This picks by
+ * position instead: one phrase per window, always the same phrase for the same
+ * window, and adjacent windows differ.
+ * @param entries - The pool to draw from.
+ * @param seed - Per-turn seed (the turn's start time), so turns differ.
+ * @param slot - Rotation window index within the phase.
+ */
+export function pickPhraseAt(entries: PhrasePool, seed: number, slot: number): string {
+  if (entries.length === 0) throw new Error('pickPhraseAt() requires a non-empty pool')
+  return entries[mixSlot(seed, slot) % entries.length] as string
+}
+
+/** Draw from `entries`: deterministic when a slot is given, random otherwise. */
+function draw(entries: PhrasePool, previous: string | undefined, at: PhraseSlot | undefined): string {
+  return at === undefined ? pickPhrase(entries, previous) : pickPhraseAt(entries, at.seed, at.slot)
 }
 
 // ── zh pools (original copy) ─────────────────────────────────────────────
@@ -301,11 +345,21 @@ export const EN_LUNAR_NEW_YEAR_PHRASES: readonly string[] = [
   'Gong Xi Fa Cai', 'New Year grind',
 ]
 
-/** Gregorian dates marked as Lunar New Year (2025–2027, extend yearly). */
+/**
+ * Gregorian dates marked as Lunar New Year (2025–2030, extend yearly).
+ *
+ * Each year lists the seven-day holiday block starting at the new moon.
+ * `tests/easter-eggs.spec.ts` fails when the table no longer covers the
+ * current year + 1, so an expired table goes red in CI instead of silently
+ * stopping the egg.
+ */
 export const LUNAR_NEW_YEAR_DAYS: Readonly<Record<string, true>> = {
   '2025-01-29': true, '2025-01-30': true, '2025-01-31': true, '2025-02-01': true, '2025-02-02': true, '2025-02-03': true, '2025-02-04': true,
   '2026-02-17': true, '2026-02-18': true, '2026-02-19': true, '2026-02-20': true, '2026-02-21': true, '2026-02-22': true, '2026-02-23': true,
   '2027-02-06': true, '2027-02-07': true, '2027-02-08': true, '2027-02-09': true, '2027-02-10': true, '2027-02-11': true, '2027-02-12': true,
+  '2028-01-26': true, '2028-01-27': true, '2028-01-28': true, '2028-01-29': true, '2028-01-30': true, '2028-01-31': true, '2028-02-01': true,
+  '2029-02-13': true, '2029-02-14': true, '2029-02-15': true, '2029-02-16': true, '2029-02-17': true, '2029-02-18': true, '2029-02-19': true,
+  '2030-02-03': true, '2030-02-04': true, '2030-02-05': true, '2030-02-06': true, '2030-02-07': true, '2030-02-08': true, '2030-02-09': true,
 }
 
 /** Phrases shown after the user interrupts and the model resumes. */
@@ -352,6 +406,56 @@ export const EN_COMPACT_RETRY_PHRASES: readonly string[] = [
   'Retrying now', 'Carrying on', 'Round three', 'Again', 'Picking it back up',
 ]
 
+/**
+ * Phrases while the provider asked for a retry (rate limit / transient error).
+ * The waiting pool cannot say this: "still queuing" reads as the model's own
+ * latency, while a retry is the provider pushing back.
+ */
+export const RETRY_PHRASES: readonly string[] = [
+  '被限流了，缓缓再试', '刚被拒了，退避一下', '稍等，重试中', '429 了，歇口气再来',
+]
+
+/** English retry phrases. */
+export const EN_RETRY_PHRASES: readonly string[] = [
+  'Rate-limited, backing off', 'Rejected — easing off and retrying', 'Holding on, retrying', '429 — catching a breath',
+]
+
+/** Phrases while a tool is parked on the user's approval. */
+export const APPROVAL_PHRASES: readonly string[] = [
+  '在等你点头', '等你批准呢——看一眼？', '模型在等你决定',
+]
+
+/** English approval phrases. */
+export const EN_APPROVAL_PHRASES: readonly string[] = [
+  'Waiting for your go-ahead', 'Your call — approval needed', 'The model is waiting on you',
+]
+
+/** Phrases while the host is compacting the context. */
+export const COMPACTION_START_PHRASES: readonly string[] = [
+  '收拾一下上下文…', '整理背包中…',
+]
+
+/** English compaction-in-progress phrases. */
+export const EN_COMPACTION_START_PHRASES: readonly string[] = [
+  'Packing up context…', 'Tidying the context…',
+]
+
+/**
+ * Pick the copy for one waiting reason, in the active language.
+ *
+ * Deterministic per stall: the caller seeds the draw with the turn and the
+ * stall's start, so repeated reads of one stall show one line (a per-read
+ * re-roll is the flicker bug this module's slot scheme exists to prevent).
+ * @param reason - Why the turn is stalled.
+ * @param at - Slot (seed + window) making the pick reproducible.
+ */
+export function waitingReasonPhrase(reason: WaitingReason, at?: PhraseSlot): string {
+  const en = langNow() === 'en'
+  if (reason === 'retry') return draw(en ? EN_RETRY_PHRASES : RETRY_PHRASES, undefined, at)
+  if (reason === 'approval') return draw(en ? EN_APPROVAL_PHRASES : APPROVAL_PHRASES, undefined, at)
+  return draw(en ? EN_COMPACTION_START_PHRASES : COMPACTION_START_PHRASES, undefined, at)
+}
+
 /** Model-switch quips keyed by a lowercase substring of the model id. */
 export const MODEL_QUIPS: Readonly<Record<string, readonly string[]>> = {
   claude: ['Claude 来了', '换 Claude 了', '让 Claude 试试', 'Claude 出战', '克劳德上线'],
@@ -383,26 +487,26 @@ export const EN_MODEL_QUIPS: Readonly<Record<string, readonly string[]>> = {
 }
 
 /** Detect a holiday for `date`, Lunar New Year first. */
-export function holidayPhrase(date: Date): string | null {
+export function holidayPhrase(date: Date, at?: PhraseSlot): string | null {
   const mmdd = `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
   const ymd = `${date.getFullYear()}-${mmdd}`
   const en = langNow() === 'en'
   if (LUNAR_NEW_YEAR_DAYS[ymd] === true) {
-    return pickPhrase(en ? EN_LUNAR_NEW_YEAR_PHRASES : LUNAR_NEW_YEAR_PHRASES)
+    return draw(en ? EN_LUNAR_NEW_YEAR_PHRASES : LUNAR_NEW_YEAR_PHRASES, undefined, at)
   }
   const pool = en ? EN_HOLIDAY_PHRASES[mmdd] : HOLIDAY_PHRASES[mmdd]
-  if (pool !== undefined) return pickPhrase(pool)
+  if (pool !== undefined) return draw(pool, undefined, at)
   return null
 }
 
 /** Pick a rare easter-egg phrase in the active language. */
-export function rarePhrase(previous?: string): string {
-  return pickPhrase(langNow() === 'en' ? EN_RARE_PHRASES : RARE_PHRASES, previous)
+export function rarePhrase(previous?: string, at?: PhraseSlot): string {
+  return draw(langNow() === 'en' ? EN_RARE_PHRASES : RARE_PHRASES, previous, at)
 }
 
 /** Pick a weekend greeting in the active language. */
-export function weekendPhrase(previous?: string): string {
-  return pickPhrase(langNow() === 'en' ? EN_WEEKEND_PHRASES : WEEKEND_PHRASES, previous)
+export function weekendPhrase(previous?: string, at?: PhraseSlot): string {
+  return draw(langNow() === 'en' ? EN_WEEKEND_PHRASES : WEEKEND_PHRASES, previous, at)
 }
 
 /** Pick a post-interruption phrase in the active language. */
@@ -508,7 +612,7 @@ export function waitingPool(): readonly string[] {
  * @param night - Mix night-owl copy into the pool.
  * @param extra - User custom phrases appended to the base (non-tier) pool.
  */
-export function thinkingPhrase(elapsedMs: number, previous?: string, night = false, extra?: readonly string[]): string {
+export function thinkingPhrase(elapsedMs: number, previous?: string, night = false, extra?: readonly string[], at?: PhraseSlot): string {
   let pool: readonly string[] = langNow() === 'en' ? EN_THINKING_PHRASES : THINKING_PHRASES
   for (const tier of thinkingPools()) {
     if (elapsedMs >= tier.atMs) {
@@ -523,14 +627,37 @@ export function thinkingPhrase(elapsedMs: number, previous?: string, night = fal
   }
   if (night && pool === (langNow() === 'en' ? EN_THINKING_PHRASES : THINKING_PHRASES)) {
     const nightPool = langNow() === 'en' ? EN_NIGHT_PHRASES : NIGHT_PHRASES
-    return pickPhrase([...pool, ...nightPool], previous)
+    return draw([...pool, ...nightPool], previous, at)
   }
-  return pickPhrase(pool, previous)
+  return draw(pool, previous, at)
 }
 
 /** Pick a waiting phrase in the active language. */
-export function waitingPhrase(previous?: string): string {
-  return pickPhrase(waitingPool(), previous)
+export function waitingPhrase(previous?: string, at?: PhraseSlot): string {
+  return draw(waitingPool(), previous, at)
+}
+
+/**
+ * The line shown when thinking turns into doing: the turn's first tool call.
+ *
+ * Deliberately its own pool rather than part of the thinking copy — it marks a
+ * transition, so it must read as one ("thought it through, getting to work")
+ * instead of as another "the model is busy" fragment.
+ */
+export const TOOL_OPENING_PHRASES: readonly string[] = [
+  '想好了，上手', '琢磨完了，动手', '思路有了，开干', '盘明白了，开工',
+  '脑内预演完毕', '想清楚了，来',
+]
+
+/** English mirror of {@link TOOL_OPENING_PHRASES}. */
+export const EN_TOOL_OPENING_PHRASES: readonly string[] = [
+  'figured it out, hands on', 'plan set, going in', 'thought it through, off we go',
+  'done mulling, starting', 'brainstorm done, hands on',
+]
+
+/** Pick the thinking→doing opening line in the active language. */
+export function toolOpeningPhrase(at?: PhraseSlot): string {
+  return draw(langNow() === 'en' ? EN_TOOL_OPENING_PHRASES : TOOL_OPENING_PHRASES, undefined, at)
 }
 
 /** Pick a tool-failure phrase in the active language. */
